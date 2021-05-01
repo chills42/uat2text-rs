@@ -6,7 +6,6 @@ extern crate num;
 extern crate num_derive;
 
 use std::fmt;
-use std::convert::TryFrom;
 use std::io::{self, BufRead};
 use std::io::Cursor;
 
@@ -73,7 +72,7 @@ bitfield!{
 
 impl fmt::Display for StateVector {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-      write!(f, "SV:\n {}\n{}\n Altitude:           {} ft ({})\n N/S velocity:       {}\n E/W velocity:       {}\n Track: \n Speed: \n Vertical rate:      {}\n UTC coupling:       {}\n TIS-B site ID:      {}\n", self.nic_string(), self.geo(), self.alt(), self.alt_type(), self.ns_vel(), self.ew_vel(), self.vv_string(), if self.raw_utc() { "yes" } else { "no" }, "?")
+      write!(f, "SV:\n {}\n{}\n Altitude:           {} ft ({})\n N/S velocity:       {}\n E/W velocity:       {}\n Track: \n Speed: \n Vertical rate:      {}\n UTC coupling:       {}\n TIS-B site ID:      {}\n", self.nic_string(), self.geo(), self.alt(), self.alt_type(), self.ns_vel(), self.ew_vel(), self.vv_string(), if self.raw_utc() { "yes" } else { "no" }, self.tisb_site_id())
     }
 }
 
@@ -98,6 +97,7 @@ impl StateVector {
       360.0 - base
     }
   }
+
   fn nic_string(&self) -> String {
     format!("NIC:                {}", self.raw_nic())
   }
@@ -176,10 +176,14 @@ impl StateVector {
       0 => "PM",
       1 ..= 8388607 => "E",
       8388608 => "EW",
-      8388608 ..= 16777215 => "W",
+      8388609 ..= 16777215 => "W",
       _ => "?"
     };
     format!(" {}\n Longitude:          {:.4} {}", self.lat_string(), self.lng(), ew)
+  }
+
+  fn tisb_site_id(&self) -> String {
+    "?".into()
   }
 }
 
@@ -237,6 +241,41 @@ impl fmt::Display for ModeStatus {
     }
 }
 
+bitfield!{
+  pub struct AuxStateVector(u64);
+  impl Debug;
+  pub raw_secondary_altitude, _ : 63, 52;
+}
+
+impl AuxStateVector {
+  fn secondary_alt(&self) -> i32 {
+    self.raw_secondary_altitude() as i32 * 25 - 1025
+  }
+}
+
+impl fmt::Display for AuxStateVector {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, " Secondary Altitude:          {:?}", self.secondary_alt())
+    }
+}
+
+bitfield!{
+  pub struct TargetState(u64);
+  impl Debug;
+  pub heading_or_track, _ : 63, 49;
+  pub target_altitude, _ : 48, 32;
+}
+
+impl TargetState {
+}
+
+impl fmt::Display for TargetState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, " Heading Or Track raw:          {:?}", self)
+    }
+}
+
+
 struct UatMessage {
   header: UatHeader,
   state_vector: Option<StateVector>,
@@ -270,45 +309,89 @@ fn print_downlink(line: String) {
     let val = rdr.read_u32::<BigEndian>().unwrap();
     let header = UatHeader(val);
 
-    let mut xxx = Vec::new();
-    xxx.extend_from_slice(&data[4..17]);
-    xxx.push(u8::min_value());
-    xxx.push(u8::min_value());
-    xxx.push(u8::min_value());
-    xxx.push(u8::min_value());
-    let mut rdr = Cursor::new(xxx);
-    let sv = rdr.read_u128::<BigEndian>().map(|state| StateVector(state)).ok();
+    println!("  Code: {}", header.code());
+
+    let mut state_data = Vec::new();
+    state_data.extend_from_slice(&data[4..17]);
+    state_data.push(u8::min_value());
+    state_data.push(u8::min_value());
+    state_data.push(u8::min_value());
+    state_data.push(u8::min_value());
+    let mut rdr = Cursor::new(state_data);
+    let sv = rdr.read_u128::<BigEndian>().map(StateVector).ok();
 
     let ms = match  header.code() {
       1 | 3 => {
-        let mut xxx = Vec::new();
-        xxx.extend_from_slice(&data[17..28]);
-        xxx.push(u8::min_value());
-        xxx.push(u8::min_value());
-        xxx.push(u8::min_value());
-        xxx.push(u8::min_value());
-        xxx.push(u8::min_value());
-        let mut rdr = Cursor::new(xxx);
-        Some(rdr.read_u128::<BigEndian>().map(|state| ModeStatus(state)).unwrap())
+        let mut mode_data = Vec::new();
+        mode_data.extend_from_slice(&data[17..28]);
+        mode_data.push(u8::min_value());
+        mode_data.push(u8::min_value());
+        mode_data.push(u8::min_value());
+        mode_data.push(u8::min_value());
+        mode_data.push(u8::min_value());
+        let mut rdr = Cursor::new(mode_data);
+        Some(rdr.read_u128::<BigEndian>().map(ModeStatus).unwrap())
       },
       _ => None
     };
     println!("{:?}", ms);
+
+    let aux_sv = match header.code() {
+      1 | 2 | 5 | 6 => {
+        let mut aux_data = Vec::new();
+        aux_data.extend_from_slice(&data[29..33]);
+        aux_data.push(u8::min_value());
+        aux_data.push(u8::min_value());
+        aux_data.push(u8::min_value());
+        aux_data.push(u8::min_value());
+        let mut rdr = Cursor::new(aux_data);
+        Some(rdr.read_u64::<BigEndian>().map(AuxStateVector).unwrap())
+      },
+      _ => None
+    };
+    let target_state = match header.code() {
+      3 | 4 => {
+        let mut target_data = Vec::new();
+        target_data.extend_from_slice(&data[29..33]);
+        target_data.push(u8::min_value());
+        target_data.push(u8::min_value());
+        target_data.push(u8::min_value());
+        target_data.push(u8::min_value());
+        let mut rdr = Cursor::new(target_data);
+        Some(rdr.read_u64::<BigEndian>().map(TargetState).unwrap())
+      },
+      6 => {
+        let mut target_data = Vec::new();
+        target_data.extend_from_slice(&data[24..28]);
+        target_data.push(u8::min_value());
+        target_data.push(u8::min_value());
+        target_data.push(u8::min_value());
+        target_data.push(u8::min_value());
+        let mut rdr = Cursor::new(target_data);
+        Some(rdr.read_u64::<BigEndian>().map(TargetState).unwrap())
+      },
+      _ => None
+    };
+    if let Some(aux_state_vector_value) = aux_sv {
+      println!("{}", aux_state_vector_value);
+    }
+
+    if let Some(target_state_value) = target_state {
+      println!("{:?}", target_state_value);
+    }
     let message = UatMessage { header, state_vector: sv, mode_status: ms };
     println!("{}", message);
 }
 
 fn main() {
     let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        if let Ok(line) = line {
-            let ch = line.chars().next().unwrap();
-            match ch {
-              '+' => print_uplink(line),
-              '-' => print_downlink(line),
-              _ => println!("UNKNOWN MESSAGE"),
-            }
-        }
+    for line in stdin.lock().lines().flatten() {
+      let ch = line.chars().next().unwrap();
+      match ch {
+        '+' => print_uplink(line),
+        '-' => print_downlink(line),
+        _ => println!("UNKNOWN MESSAGE"),
+      }
     }
 }
 
